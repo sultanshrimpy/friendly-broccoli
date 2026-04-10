@@ -1,18 +1,12 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// FILE 1: packages/client/components/modal/modals/StageBridgeLinks.tsx
-// NEW FILE — drop this alongside CreateChannel.tsx
-//
-// A multi-select picker that lets you choose which voice channels
-// should receive this channel's stage feed.
-// ─────────────────────────────────────────────────────────────────────────────
+// StageBridgeLinks.tsx
+// Multi-select picker for linking audience channels to a stage voice channel.
+// Drop this file in: packages/client/components/modal/modals/StageBridgeLinks.tsx
 
-import { createSignal, createResource, For, Show } from "solid-js";
-import { styled } from "@revolt/ui";
-import { Trans } from "@lingui/solid/macro";
+import { createSignal, For, Show } from "solid-js";
+import { styled } from "styled-system/jsx";
+import { Trans } from "@lingui-solid/solid/macro";
 import type { Channel, Server } from "revolt.js";
 
-// Read the stage-bridge URL from env — falls back to relative path
-// so it works behind your Caddy reverse proxy at /stage-bridge
 const BRIDGE_URL =
   (import.meta.env.VITE_STAGE_BRIDGE_URL as string | undefined) ??
   "/stage-bridge";
@@ -31,7 +25,7 @@ const Section = styled("div", {
 const Label = styled("span", {
   base: {
     fontSize: "12px",
-    fontWeight: 600,
+    fontWeight: "600",
     color: "var(--md-sys-color-on-surface-variant)",
     textTransform: "uppercase",
     letterSpacing: "0.05em",
@@ -60,9 +54,6 @@ const ChannelRow = styled("label", {
     padding: "var(--gap-xs) var(--gap-sm)",
     borderRadius: "var(--borderRadius-sm)",
     userSelect: "none",
-    "&:hover": {
-      background: "var(--md-sys-color-surface-container-high)",
-    },
   },
 });
 
@@ -85,22 +76,18 @@ const EmptyHint = styled("span", {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 interface Props {
-  // The server whose channels we're listing as options
   server: Server;
-  // The channel ID being configured (excluded from the list)
   excludeChannelId?: string;
-  // Controlled value — array of selected audience channel IDs
   selected: string[];
   onChange: (ids: string[]) => void;
 }
 
 export function StageBridgeLinks(props: Props) {
-  // Get all voice channels on the server except the current one
   const voiceChannels = () =>
-    [...props.server.channels.values()].filter(
+    [...(props.server.channels ?? [])].filter(
       (ch): ch is Channel =>
         ch !== undefined &&
-        ch.type === "VoiceChannel" &&
+        (ch as any).channel_type === "VoiceChannel" &&
         ch.id !== props.excludeChannelId
     );
 
@@ -145,7 +132,7 @@ export function StageBridgeLinks(props: Props) {
   );
 }
 
-// ── Helper: save links to stage-bridge after channel creation ─────────────────
+// ── Helper: save links to stage-bridge ───────────────────────────────────────
 
 export async function saveStageBridgeLinks(
   stageChannelId: string,
