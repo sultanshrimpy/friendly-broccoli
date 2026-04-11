@@ -1,42 +1,226 @@
 // bridge.ts
-// Uses LiveKit's server-side AgentDispatch / RoomService approach.
-// Rather than trying to republish WebRTC tracks (which the Node SDK doesn't
-// support), we use LiveKit's built-in "forward participant" capability via
-// the RoomService API to move the stage feed into audience rooms.
-//
-// Strategy:
-// - When a stage room becomes active, we call RoomService to create a
-//   "forwarded participant" in each linked audience room using LiveKit's
-//   participant dispatch / egress-to-ingress via WHIP/WHEP if available,
-//   OR we fall back to a simpler approach: we notify audience rooms that
-//   the stage is live via room metadata, and the frontend handles rendering
-//   the stage feed directly by connecting to both rooms.
-//
-// Since @livekit/rtc-node cannot re-publish remote tracks (it requires
-// local media sources), the cleanest self-hosted solution is to store
-// the active stage room name in the audience room's metadata so the
-// frontend can subscribe to it directly.
-
-import { RoomServiceClient } from "livekit-server-sdk";
+import {
+  Room,
+  RoomEvent,
+  RemoteTrack,
+  RemoteTrackPublication,
+  RemoteParticipant,
+} from "@livekit/rtc-node";
+import { AccessToken } from "livekit-server-sdk";
 import { config } from "./config";
 
-const room_service = new RoomServiceClient(
-  // Convert ws:// URL to http:// for the REST API
-  config.livekit.url.replace(/^ws(s)?:\/\//, "http$1://"),
-  config.livekit.api_key,
-  config.livekit.api_secret
-);
-
-// ── Active session tracking ───────────────────────────────────────────────────
-
-interface ActiveBridge {
-  stage_channel_id: string;
-  audience_channel_ids: string[];
+interface AudiencePipe {
+  channelId: string;
+  room: Room;
+  published_tracks: Map<string, RemoteTrack>;
 }
 
-const active_sessions: Map<string, ActiveBridge> = new Map();
+export class BridgeSession {
+  private stage_room: Room;
+  private audience_pipes: Map<string, AudiencePipe> = new Map();
+  private is_torn_down = false;
 
-// ── Bridge start/stop ─────────────────────────────────────────────────────────
+  constructor(
+    private stage_channel_id: string,
+    private audience_channel_ids: string[]
+  ) {
+    this.stage_room = new Room();
+  }
+
+  async start(): Promise<void> {
+    console.log(
+      `[bridge] Starting session for stage=${this.stage_channel_id} ` +
+      `→ audiences=[${this.audience_channel_ids.join(", ")}]`
+    );
+
+    for (const audience_id of this.audience_channel_ids) {
+      await this.connect_audience(audience_id);
+    }
+
+    this.stage_room.on(
+      RoomEvent.TrackSubscribed,
+      (track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
+        void this.on_track_subscribed(track, pub, participant);
+      }
+    );
+
+    this.stage_room.on(
+      RoomEvent.TrackUnsubscribed,
+      (track: RemoteTrack, pub: RemoteTrackPublication, _participant: RemoteParticipant) => {
+        void this.on_track_unsubscribed(track, pub, _participant);
+      }
+    );
+
+    this.stage_room.on(RoomEvent.Disconnected, () => {
+      console.log(`[bridge] Stage room ${this.stage_channel_id} disconnected`);
+      void this.teardown();
+    });
+
+    const stage_token = await this.make_token(this.stage_channel_id, {
+      canPublish: false,
+      canSubscribe: true,
+    });
+
+    await this.stage_room.connect(config.livekit.url, stage_token);
+    console.log(`[bridge] Bot connected to stage room ${this.stage_channel_id}`);
+  }
+
+  private async on_track_subscribed(
+    track: RemoteTrack,
+    pub: RemoteTrackPublication,
+    participant: RemoteParticipant
+  ): Promise<void> {
+    console.log(
+      `[bridge] Track subscribed: kind=${track.kind} ` +
+      `participant=${participant.identity} sid=${pub.sid}`
+    );
+    for (const pipe of this.audience_pipes.values()) {
+      await this.publish_track_to_audience(pipe, track, pub.sid);
+    }
+  }
+
+  private async on_track_unsubscribed(
+    track: RemoteTrack,
+    pub: RemoteTrackPublication,
+    _participant: RemoteParticipant
+  ): Promise<void> {
+    console.log(`[bridge] Track unsubscribed: sid=${pub.sid}`);
+    for (const pipe of this.audience_pipes.values()) {
+      const stored = pipe.published_tracks.get(pub.sid);
+      if (stored) {
+        try {
+          const local = pipe.room.localParticipant;
+          if (local) {
+            await local.unpublishTrack(stored);
+          }
+        } catch (e) {
+          console.warn(`[bridge] Error unpublishing track:`, e);
+        }
+        pipe.published_tracks.delete(pub.sid);
+      }
+    }
+  }
+
+  public has_audience(id: string): boolean {
+    return this.audience_channel_ids.includes(id);
+  }
+
+  public async connect_audience(audience_channel_id: string): Promise<void> {
+    const room = new Room();
+    const pipe: AudiencePipe = {
+      channelId: audience_channel_id,
+      room,
+      published_tracks: new Map(),
+    };
+
+    const token = await this.make_token(audience_channel_id, {
+      canPublish: true,
+      canSubscribe: false,
+    });
+
+    let connected = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await room.connect(config.livekit.url, token);
+        connected = true;
+        break;
+      } catch (e: any) {
+        if (e?.message?.includes("not exist") || e?.code === 404) {
+          console.log(
+            `[bridge] Audience room ${audience_channel_id} not ready yet, ` +
+            `retrying in 3s... (attempt ${attempt + 1}/10)`
+          );
+          await new Promise((res) => setTimeout(res, 3000));
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    if (!connected) {
+      console.warn(
+        `[bridge] Gave up connecting to audience room ${audience_channel_id} after 10 attempts`
+      );
+      return;
+    }
+
+    this.audience_pipes.set(audience_channel_id, pipe);
+    console.log(`[bridge] Bot connected to audience room ${audience_channel_id}`);
+  }
+
+  private async publish_track_to_audience(
+    pipe: AudiencePipe,
+    remote_track: RemoteTrack,
+    track_sid: string
+  ): Promise<void> {
+    try {
+      const local = pipe.room.localParticipant;
+      if (!local) {
+        console.warn(`[bridge] No local participant in audience room ${pipe.channelId}`);
+        return;
+      }
+      await local.publishTrack(remote_track, {});
+      pipe.published_tracks.set(track_sid, remote_track);
+      console.log(
+        `[bridge] Published track ${track_sid} (${remote_track.kind}) ` +
+        `to audience ${pipe.channelId}`
+      );
+    } catch (e) {
+      console.error(
+        `[bridge] Failed to publish track ${track_sid} to ${pipe.channelId}:`, e
+      );
+    }
+  }
+
+  private async make_token(
+    room_name: string,
+    grants: { canPublish: boolean; canSubscribe: boolean }
+  ): Promise<string> {
+    const token = new AccessToken(
+      config.livekit.api_key,
+      config.livekit.api_secret,
+      {
+        identity: `${config.bot_identity}-${room_name}`,
+        name: config.bot_name,
+        metadata: JSON.stringify({ is_stage_bridge: true }),
+      }
+    );
+    token.addGrant({
+      roomJoin: true,
+      room: room_name,
+      canPublish: grants.canPublish,
+      canSubscribe: grants.canSubscribe,
+      canPublishData: false,
+      hidden: true,
+    });
+    return await token.toJwt();
+  }
+
+  async teardown(): Promise<void> {
+    if (this.is_torn_down) return;
+    this.is_torn_down = true;
+    console.log(`[bridge] Tearing down session for stage=${this.stage_channel_id}`);
+
+    for (const pipe of this.audience_pipes.values()) {
+      try {
+        await pipe.room.disconnect();
+      } catch (e) {
+        console.warn(`[bridge] Error disconnecting audience ${pipe.channelId}:`, e);
+      }
+    }
+    this.audience_pipes.clear();
+
+    try {
+      await this.stage_room.disconnect();
+    } catch (e) {
+      console.warn(`[bridge] Error disconnecting stage:`, e);
+    }
+  }
+}
+
+// ── Session Registry ──────────────────────────────────────────────────────────
+
+const active_sessions: Map<string, BridgeSession> = new Map();
 
 export async function start_bridge(
   stage_channel_id: string,
@@ -47,75 +231,38 @@ export async function start_bridge(
     return;
   }
 
-  active_sessions.set(stage_channel_id, { stage_channel_id, audience_channel_ids });
-
-  console.log(
-    `[bridge] Starting bridge: stage=${stage_channel_id} ` +
-    `→ audiences=[${audience_channel_ids.join(", ")}]`
-  );
-
-  // Write the stage room name into each audience room's metadata.
-  // The frontend reads this to know which stage room to subscribe to
-  // for the read-only feed. This is the reliable self-hosted approach
-  // since it doesn't require egress workers or track-level forwarding.
-  for (const audience_id of audience_channel_ids) {
-    try {
-      await room_service.updateRoomMetadata(
-        audience_id,
-        JSON.stringify({
-          stage_feed: stage_channel_id,
-          stage_active: true,
-        })
-      );
-      console.log(
-        `[bridge] Set stage feed metadata on audience room ${audience_id} ` +
-        `→ stage=${stage_channel_id}`
-      );
-    } catch (e) {
-      // Audience room may not exist yet if no one has joined —
-      // that's fine, the frontend will poll /status to get the mapping
-      console.warn(
-        `[bridge] Could not update metadata for audience room ${audience_id} ` +
-        `(room may not exist yet):`, e
-      );
-    }
+  const session = new BridgeSession(stage_channel_id, audience_channel_ids);
+  active_sessions.set(stage_channel_id, session);
+  try {
+    await session.start();
+  } catch (e) {
+    console.error(`[bridge] Failed to start session for ${stage_channel_id}:`, e);
+    active_sessions.delete(stage_channel_id);
+    await session.teardown();
   }
 }
 
 export async function stop_bridge(stage_channel_id: string): Promise<void> {
   const session = active_sessions.get(stage_channel_id);
-  if (!session) {
-    console.log(`[bridge] No active session for ${stage_channel_id}, nothing to stop`);
-    return;
-  }
-
-  console.log(`[bridge] Stopping bridge for stage=${stage_channel_id}`);
-
-  // Clear the stage feed metadata from all linked audience rooms
-  for (const audience_id of session.audience_channel_ids) {
-    try {
-      await room_service.updateRoomMetadata(
-        audience_id,
-        JSON.stringify({
-          stage_feed: null,
-          stage_active: false,
-        })
-      );
-      console.log(`[bridge] Cleared stage feed metadata on audience room ${audience_id}`);
-    } catch (e) {
-      console.warn(`[bridge] Could not clear metadata for ${audience_id}:`, e);
-    }
-  }
-
+  if (!session) return;
   active_sessions.delete(stage_channel_id);
+  await session.teardown();
 }
 
 export function get_active_sessions(): string[] {
   return Array.from(active_sessions.keys());
 }
 
-// ── Active link lookup (used by API status endpoint) ─────────────────────────
-
-export function get_session(stage_channel_id: string): ActiveBridge | undefined {
-  return active_sessions.get(stage_channel_id);
+export async function apply_pending_metadata(audience_channel_id: string): Promise<void> {
+  for (const session of active_sessions.values()) {
+    if (session.has_audience(audience_channel_id)) {
+      console.log(`[bridge] Connecting to late-joining audience room ${audience_channel_id}`);
+      try {
+        await session.connect_audience(audience_channel_id);
+      } catch (e) {
+        console.warn(`[bridge] Could not connect to audience room ${audience_channel_id}:`, e);
+      }
+      return;
+    }
+  }
 }
